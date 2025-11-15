@@ -30,14 +30,27 @@ export const AuthModal = ({ open, onClose, onEmailAuth, onGoogleAuth }: AuthModa
       return;
     }
 
+    if (password.length < 6) {
+      toast({
+        title: "Invalid password",
+        description: "Password must be at least 6 characters",
+        variant: "destructive",
+      });
+      return;
+    }
+
     setIsLoading(true);
     try {
       await onEmailAuth(email, password, isSignUp);
+      toast({
+        title: isSignUp ? "Account created!" : "Welcome back!",
+        description: isSignUp ? "Your account has been created successfully" : "You've been signed in",
+      });
       onClose();
     } catch (error: any) {
       toast({
         title: "Authentication failed",
-        description: error.message,
+        description: error.message || "An error occurred",
         variant: "destructive",
       });
     } finally {
@@ -49,14 +62,12 @@ export const AuthModal = ({ open, onClose, onEmailAuth, onGoogleAuth }: AuthModa
     setIsLoading(true);
     try {
       await onGoogleAuth();
-      onClose();
     } catch (error: any) {
       toast({
         title: "Authentication failed",
-        description: error.message,
+        description: error.message || "An error occurred",
         variant: "destructive",
       });
-    } finally {
       setIsLoading(false);
     }
   };

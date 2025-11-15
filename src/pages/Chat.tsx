@@ -1,10 +1,7 @@
 import { useState, useEffect, useRef } from "react";
-import { User } from "firebase/auth";
-import { collection, addDoc, query, where, orderBy, onSnapshot, deleteDoc, doc } from "firebase/firestore";
-import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
-import { httpsCallable } from "firebase/functions";
-import { db, storage, functions } from "@/config/firebase";
-import { Message, Document } from "@/types";
+import { User } from "@supabase/supabase-js";
+import { supabase } from "@/integrations/supabase/client";
+import { Message, Document, AgentType } from "@/types";
 import { ChatMessage } from "@/components/ChatMessage";
 import { ChatInput } from "@/components/ChatInput";
 import { DocumentPanel } from "@/components/DocumentPanel";
@@ -24,71 +21,128 @@ export const Chat = ({ user, onLogout }: ChatProps) => {
   const { toast } = useToast();
 
   useEffect(() => {
-    const messagesQuery = query(
-      collection(db, "messages"),
-      where("userId", "==", user.uid),
-      orderBy("timestamp", "asc")
-    );
+    // Load messages
+    const loadMessages = async () => {
+      const { data, error } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: true });
 
-    const unsubscribeMessages = onSnapshot(messagesQuery, (snapshot) => {
-      const msgs: Message[] = snapshot.docs.map((doc) => ({
+      if (error) {
+        console.error('Error loading messages:', error);
+        return;
+      }
+
+      setMessages(data.map(msg => ({
+        id: msg.id,
+        userId: msg.user_id,
+        content: msg.content,
+        agent: (msg.agent_type || 'orchestrator') as AgentType,
+        timestamp: new Date(msg.created_at),
+        isUser: msg.role === 'user',
+      })));
+    };
+
+    // Load documents
+    const loadDocuments = async () => {
+      const { data, error } = await supabase
+        .from('documents')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('Error loading documents:', error);
+        return;
+      }
+
+      setDocuments(data.map(doc => ({
         id: doc.id,
-        ...doc.data(),
-        timestamp: doc.data().timestamp?.toDate() || new Date(),
-      })) as Message[];
-      setMessages(msgs);
-    });
+        userId: doc.user_id,
+        name: doc.name,
+        url: doc.file_url,
+        size: 0, // Not stored in new schema
+        type: doc.file_type,
+        uploadedAt: new Date(doc.created_at),
+      })));
+    };
 
-    const documentsQuery = query(
-      collection(db, "documents"),
-      where("userId", "==", user.uid),
-      orderBy("uploadedAt", "desc")
-    );
+    loadMessages();
+    loadDocuments();
 
-    const unsubscribeDocuments = onSnapshot(documentsQuery, (snapshot) => {
-      const docs: Document[] = snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-        uploadedAt: doc.data().uploadedAt?.toDate() || new Date(),
-      })) as Document[];
-      setDocuments(docs);
-    });
+    // Set up realtime subscriptions
+    const messagesSubscription = supabase
+      .channel('messages-channel')
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'messages',
+        filter: `user_id=eq.${user.id}`
+      }, () => {
+        loadMessages();
+      })
+      .subscribe();
+
+    const documentsSubscription = supabase
+      .channel('documents-channel')
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'documents',
+        filter: `user_id=eq.${user.id}`
+      }, () => {
+        loadDocuments();
+      })
+      .subscribe();
 
     return () => {
-      unsubscribeMessages();
-      unsubscribeDocuments();
+      supabase.removeChannel(messagesSubscription);
+      supabase.removeChannel(documentsSubscription);
     };
-  }, [user.uid]);
+  }, [user.id]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   const handleSendMessage = async (content: string) => {
-    const userMessage: Omit<Message, "id"> = {
-      userId: user.uid,
-      content,
-      agent: "orchestrator",
-      timestamp: new Date(),
-      isUser: true,
-    };
+    // Add user message
+    const { error: userMsgError } = await supabase
+      .from('messages')
+      .insert({
+        user_id: user.id,
+        content,
+        role: 'user',
+        agent_type: null,
+      });
 
-    await addDoc(collection(db, "messages"), userMessage);
+    if (userMsgError) {
+      toast({
+        title: "Error",
+        description: "Failed to send message",
+        variant: "destructive",
+      });
+      return;
+    }
 
     try {
-      const orchestrateAgents = httpsCallable(functions, "orchestrateAgents");
-      const result = await orchestrateAgents({ prompt: content, userId: user.uid });
-      const response = result.data as { response: string; agent: string };
+      // Call AI orchestrator edge function
+      const { data, error } = await supabase.functions.invoke('orchestrate-agents', {
+        body: { prompt: content, userId: user.id }
+      });
 
-      const aiMessage: Omit<Message, "id"> = {
-        userId: user.uid,
-        content: response.response,
-        agent: response.agent as any,
-        timestamp: new Date(),
-        isUser: false,
-      };
+      if (error) throw error;
 
-      await addDoc(collection(db, "messages"), aiMessage);
+      // Add AI response
+      await supabase
+        .from('messages')
+        .insert({
+          user_id: user.id,
+          content: data.response,
+          role: 'assistant',
+          agent_type: data.agent,
+        });
     } catch (error: any) {
       toast({
         title: "Error",
@@ -99,27 +153,80 @@ export const Chat = ({ user, onLogout }: ChatProps) => {
   };
 
   const handleUploadDocument = async (file: File) => {
-    const storageRef = ref(storage, `documents/${user.uid}/${Date.now()}_${file.name}`);
-    const snapshot = await uploadBytes(storageRef, file);
-    const url = await getDownloadURL(snapshot.ref);
+    try {
+      // Upload to storage
+      const filePath = `${user.id}/${Date.now()}_${file.name}`;
+      const { error: uploadError } = await supabase.storage
+        .from('documents')
+        .upload(filePath, file);
 
-    await addDoc(collection(db, "documents"), {
-      userId: user.uid,
-      name: file.name,
-      url,
-      size: file.size,
-      type: file.type,
-      uploadedAt: new Date(),
-    });
+      if (uploadError) throw uploadError;
+
+      // Get public URL
+      const { data: { publicUrl } } = supabase.storage
+        .from('documents')
+        .getPublicUrl(filePath);
+
+      // Save to database
+      const { error: dbError } = await supabase
+        .from('documents')
+        .insert({
+          user_id: user.id,
+          name: file.name,
+          file_url: publicUrl,
+          file_type: file.type,
+        });
+
+      if (dbError) throw dbError;
+
+      toast({
+        title: "Success",
+        description: "Document uploaded successfully",
+      });
+    } catch (error: any) {
+      toast({
+        title: "Error",
+        description: error.message || "Failed to upload document",
+        variant: "destructive",
+      });
+    }
   };
 
   const handleDeleteDocument = async (id: string) => {
     const document = documents.find((d) => d.id === id);
     if (!document) return;
 
-    const storageRef = ref(storage, document.url);
-    await deleteObject(storageRef);
-    await deleteDoc(doc(db, "documents", id));
+    try {
+      // Extract file path from URL
+      const urlParts = document.url.split('/');
+      const filePath = urlParts.slice(urlParts.indexOf('documents') + 1).join('/');
+
+      // Delete from storage
+      const { error: storageError } = await supabase.storage
+        .from('documents')
+        .remove([filePath]);
+
+      if (storageError) throw storageError;
+
+      // Delete from database
+      const { error: dbError } = await supabase
+        .from('documents')
+        .delete()
+        .eq('id', id);
+
+      if (dbError) throw dbError;
+
+      toast({
+        title: "Success",
+        description: "Document deleted successfully",
+      });
+    } catch (error: any) {
+      toast({
+        title: "Error",
+        description: error.message || "Failed to delete document",
+        variant: "destructive",
+      });
+    }
   };
 
   return (
